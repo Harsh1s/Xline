@@ -128,72 +128,94 @@ where
         }
     }
 
-    /// Takes a function f and run retry.
+    /// Takes a function f and runs retry.
     async fn retry<'a, R, F>(&'a self, f: impl Fn(&'a Api) -> F) -> Result<R, tonic::Status>
     where
         F: Future<Output = Result<R, CurpError>>,
     {
         let mut backoff = self.config.init_backoff();
-        let mut last_err = None;
-        while let Some(delay) = backoff.next_delay() {
-            let err = match f(&self.inner).await {
+        let mut consecutive_client_error_count = 0;
+        const MAX_CONSECUTIVE_CLIENT_ERROR_COUNT: usize = 3;
+
+        loop {
+            match f(&self.inner).await {
                 Ok(res) => return Ok(res),
-                Err(err) => err,
-            };
+                Err(err) => {
+                    match err {
+                        // Errors that should not retry
+                        CurpError::Duplicated(_)
+                        | CurpError::ShuttingDown(_)
+                        | CurpError::InvalidConfig(_)
+                        | CurpError::NodeNotExists(_)
+                        | CurpError::NodeAlreadyExists(_)
+                        | CurpError::LearnerNotCatchUp(_) => {
+                            return Err(tonic::Status::from(err));
+                        }
+                        // Server-side errors that should retry after a delay
+                        CurpError::ExpiredClientId(_)
+                        | CurpError::KeyConflict(_)
+                        | CurpError::Internal(_)
+                        | CurpError::LeaderTransfer(_)
+                        | CurpError::RpcTransport(_) => {
+                            consecutive_client_error_count = 0;
+                            let delay = match backoff.next_delay() {
+                                Some(delay) => delay,
+                                None => {
+                                    return Err(tonic::Status::deadline_exceeded(
+                                        "request timeout",
+                                    ));
+                                }
+                            };
+                            if let CurpError::RpcTransport(_) = &err {
+                                // Update leader state if we got an RPC transport error
+                                if let Err(e) = self.inner.fetch_leader_id(true).await {
+                                    warn!("fetch leader failed, error {e:?}");
+                                }
+                            }
 
-            match err {
-                // some errors that should not retry
-                CurpError::Duplicated(_)
-                | CurpError::ShuttingDown(_)
-                | CurpError::InvalidConfig(_)
-                | CurpError::NodeNotExists(_)
-                | CurpError::NodeAlreadyExists(_)
-                | CurpError::LearnerNotCatchUp(_) => {
-                    return Err(tonic::Status::from(err));
-                }
+                            #[cfg(feature = "client-metrics")]
+                            super::metrics::get().client_retry_count.add(1, &[]);
 
-                // some errors that could have a retry
-                CurpError::ExpiredClientId(_)
-                | CurpError::KeyConflict(_)
-                | CurpError::Internal(_)
-                | CurpError::LeaderTransfer(_) => {}
+                            // warn!(
+                            //     "got error: {err:?}, retry on {} seconds later",
+                            //     err = err,
+                            //     delay.as_secs_f32()
+                            // );
+                            warn!(
+                                "got error: {err:?}, retry on {} seconds later",
+                                delay.as_secs_f32()
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
+                        // Client-side errors that should retry immediately
+                        CurpError::WrongClusterVersion(_) | CurpError::Redirect(_) => {
+                            if let CurpError::WrongClusterVersion(_) = &err {
+                                // Update the cluster state if got WrongClusterVersion
+                                if let Err(e) = self.inner.fetch_cluster(true).await {
+                                    warn!("fetch cluster failed, error {e:?}");
+                                }
+                            } else if let CurpError::Redirect(Redirect { leader_id, term }) = &err {
+                                // Update the leader state if got Redirect
+                                let _ = self.inner.update_leader(*leader_id, *term).await;
+                            }
 
-                // update leader state if we got a rpc transport error
-                CurpError::RpcTransport(_) => {
-                    if let Err(e) = self.inner.fetch_leader_id(true).await {
-                        warn!("fetch leader failed, error {e:?}");
+                            warn!("got error: {err:?}, retrying immediately", err = err);
+
+                            consecutive_client_error_count += 1;
+                            if consecutive_client_error_count >= MAX_CONSECUTIVE_CLIENT_ERROR_COUNT
+                            {
+                                warn!(
+                                    "Maximum consecutive client error count reached, not retrying anymore"
+                                );
+                                return Err(tonic::Status::deadline_exceeded(
+                                    "maximum consecutive client error count reached",
+                                ));
+                            }
+                        }
                     }
-                }
-
-                // update the cluster state if got WrongClusterVersion
-                CurpError::WrongClusterVersion(_) => {
-                    // the inner client should automatically update cluster state when fetch_cluster
-                    if let Err(e) = self.inner.fetch_cluster(true).await {
-                        warn!("fetch cluster failed, error {e:?}");
-                    }
-                }
-
-                // update the leader state if got Redirect
-                CurpError::Redirect(Redirect { leader_id, term }) => {
-                    let _ig = self.inner.update_leader(leader_id, term).await;
                 }
             }
-
-            #[cfg(feature = "client-metrics")]
-            super::metrics::get().client_retry_count.add(1, &[]);
-
-            warn!(
-                "got error: {err:?}, retry on {} seconds later",
-                delay.as_secs_f32()
-            );
-            last_err = Some(err);
-            tokio::time::sleep(delay).await;
         }
-
-        Err(tonic::Status::deadline_exceeded(format!(
-            "request timeout, last error: {:?}",
-            last_err.unwrap_or_else(|| unreachable!("last error must be set"))
-        )))
     }
 }
 

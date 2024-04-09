@@ -1,5 +1,6 @@
 fn main() {
     tonic_build::configure()
+        .protoc_arg("--experimental_allow_proto3_optional")
         .type_attribute(
             "ProposeConfChangeRequest.ConfChange",
             "#[derive(serde::Deserialize, serde::Serialize)]",
@@ -13,6 +14,7 @@ fn main() {
     let mut prost_config = prost_build::Config::new();
     prost_config.bytes([".inner_messagepb.InstallSnapshotRequest"]);
     tonic_build::configure()
+        .protoc_arg("--experimental_allow_proto3_optional")
         .compile_with_config(
             prost_config,
             &["./proto/inner_message.proto"],
