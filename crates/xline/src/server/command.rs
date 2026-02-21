@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use engine::{Snapshot, TransactionApi};
 use event_listener::Event;
 use parking_lot::RwLock;
-use tracing::warn;
+use tracing::{debug, warn};
 use utils::{barrier::IdBarrier, table_names::META_TABLE};
 use xlineapi::{
     classifier::RequestClassifier,
@@ -91,6 +91,33 @@ pub(crate) struct CommandExecutor {
 pub(crate) trait QuotaChecker: Sync + Send + Debug {
     /// Check if the command executor has enough quota to execute the command
     fn check(&self, cmd: &Command) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutionPath {
+    FastPath,
+    ReadOnly,
+    SlowPathExecute,
+    SlowPathApplyOnly,
+}
+
+impl ExecutionPath {
+    const fn as_str(self) -> &'static str {
+        match self {
+            ExecutionPath::FastPath => "fast_path",
+            ExecutionPath::ReadOnly => "read_only",
+            ExecutionPath::SlowPathExecute => "slow_path_execute",
+            ExecutionPath::SlowPathApplyOnly => "slow_path_apply_only",
+        }
+    }
+}
+
+const fn after_sync_execution_path(to_execute: bool) -> ExecutionPath {
+    if to_execute {
+        ExecutionPath::SlowPathExecute
+    } else {
+        ExecutionPath::SlowPathApplyOnly
+    }
 }
 
 /// Quota checker for `Command`
@@ -422,6 +449,11 @@ impl CurpCommandExecutor<Command> for CommandExecutor {
         let auth_info = cmd.auth_info();
         let wrapper = cmd.request();
         self.auth_storage.check_permission(wrapper, auth_info)?;
+        debug!(
+            execution_path = ExecutionPath::FastPath.as_str(),
+            request = ?wrapper,
+            "executing command"
+        );
         match &wrapper {
             x if x.is_kv_backend() => self.kv_storage.execute(wrapper, None),
             x if x.is_auth_backend() => self.auth_storage.execute(wrapper),
@@ -440,6 +472,11 @@ impl CurpCommandExecutor<Command> for CommandExecutor {
     > {
         let er = self.execute(cmd)?;
         let wrapper = cmd.request();
+        debug!(
+            execution_path = ExecutionPath::ReadOnly.as_str(),
+            request = ?wrapper,
+            "executing read-only command"
+        );
         let rev = match wrapper {
             x if x.is_auth_backend() => self.auth_storage.revision_gen().get(),
             x if (x.is_kv_backend() || x.is_lease_backend() || x.is_alarm_backend()) => {
@@ -487,6 +524,11 @@ impl CurpCommandExecutor<Command> for CommandExecutor {
         states.update_result(|c| {
             let (cmd, to_execute) = c.into_parts();
             let wrapper = cmd.request();
+            debug!(
+                execution_path = after_sync_execution_path(to_execute).as_str(),
+                request = ?wrapper,
+                "syncing command"
+            );
             let (asr, er) = match wrapper {
                 x if x.is_kv_backend() => self.after_sync_kv(
                     wrapper,
@@ -587,6 +629,21 @@ mod test {
     use xlineapi::{LeaseGrantRequest, PutRequest, Request, RequestOp, TxnRequest};
 
     use super::*;
+
+    #[test]
+    fn execution_path_labels_are_stable() {
+        assert_eq!(ExecutionPath::FastPath.as_str(), "fast_path");
+        assert_eq!(ExecutionPath::ReadOnly.as_str(), "read_only");
+        assert_eq!(
+            after_sync_execution_path(true).as_str(),
+            "slow_path_execute"
+        );
+        assert_eq!(
+            after_sync_execution_path(false).as_str(),
+            "slow_path_apply_only"
+        );
+    }
+
     #[test]
     fn cmd_size_should_return_size_of_command() {
         let put_req1 = PutRequest {
